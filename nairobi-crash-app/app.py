@@ -18,7 +18,7 @@ warnings.filterwarnings('ignore')
 
 # Configure the page
 st.set_page_config(
-    page_title="Nairobi Crash Risk Predictor",
+    page_title="Nairobi Crash Risk Predictor & Hotspot Analysis",
     page_icon="🚗",
     layout="wide"
 )
@@ -39,33 +39,14 @@ def load_data():
 
 @st.cache_resource
 def load_models():
-    """Load the trained models"""
+    """Load the best trained model"""
     try:
-        model_names = [
-            'best_model_random_forest.pkl',
-            'model_random_forest.pkl',
-            'best_model_xgboost.pkl',
-            'model_xgboost.pkl'
-        ]
-        
-        model = None
-        for name in model_names:
-            try:
-                model = joblib.load(name)
-                st.success(f"✅ Loaded model: {name}")
-                break
-            except FileNotFoundError:
-                continue
-        
-        if model is None:
-            st.error("❌ No model files found! Please add your trained model files.")
-            return None, None
-            
+        model = joblib.load('model_xgboost.pkl')
         label_encoder = joblib.load('label_encoder.pkl')
-        st.success("✅ Loaded label encoder")
-        
         return model, label_encoder
-        
+    except FileNotFoundError as e:
+        st.warning(f"⚠️ Model files not found. Please ensure 'model_xgboost.pkl' and 'label_encoder.pkl' are in the app directory.")
+        return None, None
     except Exception as e:
         st.error(f"❌ Error loading models: {str(e)}")
         return None, None
@@ -152,13 +133,13 @@ def calculate_dynamic_risk_score(severity, confidence, nearby_crashes, weather_f
 def get_risk_level(risk_score):
     """Convert risk score to risk level"""
     if risk_score >= 7:
-        return "🔴 EXTREME RISK", "red"
+        return "EXTREME RISK", "red"
     elif risk_score >= 5:
-        return "🟠 HIGH RISK", "orange"
+        return "HIGH RISK", "orange"
     elif risk_score >= 3:
-        return "🟡 MODERATE RISK", "yellow"
+        return "MODERATE RISK", "yellow"
     else:
-        return "🟢 LOW RISK", "green"
+        return "LOW RISK", "green"
 
 def get_traffic_risk_factor(hour, day_of_week):
     """Get traffic-based risk factor"""
@@ -192,15 +173,28 @@ def get_nearby_crashes(df, lat, lon, radius_km=2):
         return pd.DataFrame()
     
     valid_coords = df.dropna(subset=['latitude', 'longitude'])
+    if len(valid_coords) == 0:
+        return pd.DataFrame()
     
-    lat_diff = (valid_coords['latitude'] - lat) * 111
-    lon_diff = (valid_coords['longitude'] - lon) * 111 * np.cos(np.radians(lat))
-    distance = np.sqrt(lat_diff**2 + lon_diff**2)
+    earth_radius = 6371
+    lat_rad = np.radians(lat)
+    lon_rad = np.radians(lon)
     
-    nearby = valid_coords[distance <= radius_km].copy()
-    nearby['distance_km'] = distance[distance <= radius_km]
+    crash_lat_rad = np.radians(valid_coords['latitude'])
+    crash_lon_rad = np.radians(valid_coords['longitude'])
     
-    return nearby.sort_values('distance_km')
+    dlat = crash_lat_rad - lat_rad
+    dlon = crash_lon_rad - lon_rad
+    
+    a = np.sin(dlat/2)**2 + np.cos(lat_rad) * np.cos(crash_lat_rad) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    distances = earth_radius * c
+    
+    nearby_mask = distances <= radius_km
+    nearby_crashes = valid_coords[nearby_mask].copy()
+    nearby_crashes['distance_km'] = distances[nearby_mask]
+    
+    return nearby_crashes.sort_values('distance_km')
 
 def get_safety_recommendations(severity, hour, is_weekend, is_rush_hour, is_night, nearby_crashes):
     """Generate safety recommendations based on prediction and context"""
@@ -221,21 +215,20 @@ def get_safety_recommendations(severity, hour, is_weekend, is_rush_hour, is_nigh
         recommendations.append("✅ Relatively safe area - maintain normal precautions")
     
     if is_rush_hour:
-        recommendations.extend([
-            "🚦 Rush hour traffic - expect congestion",
-            "⏰ Allow extra travel time",
-            "🚌 Watch for matatus making sudden stops"
-        ])
+        recommendations.append("🚦 Rush hour traffic - expect congestion and aggressive driving")
     
     if is_night:
         recommendations.extend([
-            "🌙 Night driving - use headlights and drive slower",
-            "👁️ Extra caution for pedestrians (may be less visible)",
-            "🔦 Ensure all lights are working properly"
+            "🌙 Night time driving - use headlights and reduce speed",
+            "👁️ Extra vigilance for pedestrians and cyclists",
+            "🔦 Ensure good visibility and avoid fatigue"
         ])
     
     if is_weekend:
         recommendations.append("🍺 Weekend - watch for impaired drivers, especially at night")
+    
+    if 6 <= hour <= 8:
+        recommendations.append("⏰ School hours - watch for children near schools")
     
     if len(nearby_crashes) > 0:
         severe_nearby = len(nearby_crashes[nearby_crashes['severity_category'] == 'Severe'])
@@ -316,30 +309,239 @@ def save_to_history(prediction_results):
     if len(st.session_state.user_history) > 50:
         st.session_state.user_history = st.session_state.user_history[-50:]
 
-# Common Nairobi locations for quick selection
+def calculate_route_risk(df, start_lat, start_lon, end_lat, end_lon, num_points=10):
+    """Calculate risk along a route by sampling points"""
+    route_points = []
+    
+    # Generate points along the route (simple linear interpolation)
+    for i in range(num_points):
+        t = i / (num_points - 1)
+        lat = start_lat + t * (end_lat - start_lat)
+        lon = start_lon + t * (end_lon - start_lon)
+        route_points.append((lat, lon))
+    
+    route_risks = []
+    for lat, lon in route_points:
+        nearby_crashes = get_nearby_crashes(df, lat, lon, radius_km=1)
+        if len(nearby_crashes) > 0:
+            severe_count = len(nearby_crashes[nearby_crashes['severity_category'] == 'Severe'])
+            risk = severe_count / len(nearby_crashes) if len(nearby_crashes) > 0 else 0
+        else:
+            risk = 0
+        route_risks.append(risk)
+    
+    return route_points, route_risks
+
+# Comprehensive Nairobi locations for quick selection
 NAIROBI_LOCATIONS = {
+    # Central Business District & City Center
     "CBD/City Center": (-1.2864, 36.8172),
+    "Kenyatta Avenue": (-1.2833, 36.8167),
+    "Uhuru Highway": (-1.2864, 36.8172),
+    "Haile Selassie Avenue": (-1.2889, 36.8236),
+    "Tom Mboya Street": (-1.2833, 36.8194),
+    "Moi Avenue": (-1.2847, 36.8208),
+    "Ronald Ngala Street": (-1.2819, 36.8181),
+    "River Road": (-1.2806, 36.8236),
+    "Latema Road": (-1.2792, 36.8222),
+    "Accra Road": (-1.2875, 36.8153),
+    
+    # Westlands & Surroundings
     "Westlands": (-1.2676, 36.8108),
-    "Karen": (-1.3197, 36.7085),
-    "Kilimani": (-1.2921, 36.7872),
-    "Lavington": (-1.2836, 36.7672),
-    "Kileleshwa": (-1.2836, 36.7672),
+    "Sarit Centre": (-1.2639, 36.8083),
+    "ABC Place": (-1.2653, 36.8097),
+    "Westgate Mall": (-1.2653, 36.8097),
+    "Chiromo": (-1.2708, 36.8056),
     "Parklands": (-1.2630, 36.8581),
+    "Highridge": (-1.2597, 36.8042),
+    "Spring Valley": (-1.2542, 36.8000),
+    
+    # Kilimani & Surroundings
+    "Kilimani": (-1.2921, 36.7872),
+    "Yaya Centre": (-1.2931, 36.7881),
+    "Hurlingham": (-1.2958, 36.7833),
+    "Kileleshwa": (-1.2836, 36.7672),
+    "Lavington": (-1.2836, 36.7672),
+    "Dennis Pritt Road": (-1.2958, 36.7806),
+    "Wood Avenue": (-1.2944, 36.7889),
+    "Argwings Kodhek Road": (-1.2931, 36.7847),
+    
+    # Karen & Langata
+    "Karen": (-1.3197, 36.7085),
+    "Karen Shopping Centre": (-1.3181, 36.7097),
+    "Langata": (-1.3515, 36.7519),
+    "Langata Road": (-1.3364, 36.7519),
+    "Wilson Airport": (-1.3208, 36.8153),
+    "Nairobi National Park Gate": (-1.3736, 36.8583),
+    "Galleria Mall": (-1.3181, 36.7097),
+    "Junction Mall": (-1.3208, 36.7125),
+    
+    # Eastlands
     "Eastleigh": (-1.2753, 36.8442),
+    "Eastleigh Section 1": (-1.2708, 36.8472),
+    "Eastleigh Section 2": (-1.2764, 36.8458),
+    "Eastleigh Section 3": (-1.2792, 36.8444),
+    "Garissa Lodge": (-1.2736, 36.8486),
+    "First Avenue": (-1.2722, 36.8458),
+    "General Waruinge Street": (-1.2750, 36.8472),
+    
+    # South Areas
     "South B": (-1.3142, 36.8297),
     "South C": (-1.3225, 36.8297),
-    "Langata": (-1.3515, 36.7519),
-    "Kasarani": (-1.2258, 36.8969),
+    "Nyayo Stadium": (-1.3142, 36.8264),
+    "Bellevue": (-1.3181, 36.8319),
+    "Nairobi West": (-1.3264, 36.8208),
+    "Madaraka": (-1.3097, 36.8264),
+    "Nyayo Highrise": (-1.3125, 36.8278),
+    
+    # Industrial Area & Surroundings
+    "Industrial Area": (-1.3208, 36.8472),
+    "Enterprise Road": (-1.3236, 36.8486),
+    "Likoni Road": (-1.3264, 36.8500),
+    "Mombasa Road": (-1.3364, 36.8297),
+    "Imara Daima": (-1.3542, 36.8583),
+    "Nyayo Embakasi": (-1.3458, 36.8639),
+    
+    # Embakasi & Surroundings
     "Embakasi": (-1.3031, 36.8919),
-    "Kibera": (-1.3133, 36.7919),
+    "Pipeline": (-1.3125, 36.8806),
+    "Donholm": (-1.2958, 36.8944),
+    "Umoja": (-1.2875, 36.8972),
+    "Kariobangi": (-1.2653, 36.8806),
+    "Komarock": (-1.2792, 36.9167),
+    "Kayole": (-1.2736, 36.9194),
+    "Mihango": (-1.3097, 36.8889),
+    
+    # Kasarani & Northern Areas
+    "Kasarani": (-1.2258, 36.8969),
+    "Mwiki": (-1.2125, 36.8944),
+    "Githurai": (-1.1958, 36.9000),
+    "Kahawa": (-1.1833, 36.9167),
+    "Kahawa West": (-1.1806, 36.9139),
+    "Zimmerman": (-1.2042, 36.8917),
+    "Roysambu": (-1.2167, 36.8889),
+    "Thome": (-1.2292, 36.8861),
+    
+    # Mathare & Surroundings
     "Mathare": (-1.2597, 36.8581),
+    "Mathare North": (-1.2542, 36.8597),
+    "Mathare Area 3": (-1.2625, 36.8611),
+    "Huruma": (-1.2486, 36.8556),
+    "Ngei": (-1.2458, 36.8583),
+    "Kiamaiko": (-1.2514, 36.8639),
+    
+    # Kibera & Surroundings
+    "Kibera": (-1.3133, 36.7919),
+    "Olympic": (-1.3167, 36.7889),
+    "Laini Saba": (-1.3181, 36.7861),
+    "Makina": (-1.3208, 36.7833),
+    "Soweto": (-1.3153, 36.7944),
+    "Gatwekera": (-1.3125, 36.7972),
+    
+    # Major Roads & Highways
     "Ngong Road": (-1.3031, 36.7519),
     "Thika Road": (-1.2297, 36.8581),
-    "Mombasa Road": (-1.3364, 36.8297),
     "Waiyaki Way": (-1.2676, 36.7672),
-    "Uhuru Highway": (-1.2864, 36.8172)
+    "Jogoo Road": (-1.2875, 36.8472),
+    "Outer Ring Road": (-1.2458, 36.8333),
+    "Eastern Bypass": (-1.2792, 36.9000),
+    "Southern Bypass": (-1.3542, 36.7806),
+    "Northern Bypass": (-1.1958, 36.8500),
+    
+    # Universities & Institutions
+    "University of Nairobi": (-1.2792, 36.8167),
+    "Kenyatta University": (-1.1833, 36.9306),
+    "USIU": (-1.2292, 36.8889),
+    "Strathmore University": (-1.3097, 36.8153),
+    "Daystar University": (-1.3458, 36.7361),
+    
+    # Hospitals
+    "Kenyatta National Hospital": (-1.3014, 36.8069),
+    "Nairobi Hospital": (-1.2931, 36.8097),
+    "Aga Khan Hospital": (-1.2708, 36.8125),
+    "MP Shah Hospital": (-1.2708, 36.8097),
+    "Gertrude's Hospital": (-1.2653, 36.8069),
+    
+    # Shopping Centers & Malls
+    "Village Market": (-1.2208, 36.8056),
+    "Two Rivers Mall": (-1.2125, 36.8028),
+    "Garden City Mall": (-1.2236, 36.8083),
+    "Nextgen Mall": (-1.2208, 36.8111),
+    "The Hub Karen": (-1.3236, 36.7069),
+    "Prestige Plaza": (-1.2708, 36.8139),
+    "T-Mall": (-1.2542, 36.8014),
+    
+    # Transport Hubs
+    "Jomo Kenyatta International Airport": (-1.3192, 36.9278),
+    "Wilson Airport": (-1.3208, 36.8153),
+    "Railways Station": (-1.2847, 36.8278),
+    "Country Bus Station": (-1.2806, 36.8194),
+    "Machakos Bus Station": (-1.2819, 36.8222),
+    "OTC Bus Station": (-1.2833, 36.8208),
+    
+    # Stages & Bus Stops
+    "Kencom Stage": (-1.2847, 36.8194),
+    "Koja Stage": (-1.2819, 36.8167),
+    "Fire Station": (-1.2875, 36.8181),
+    "GPO Stage": (-1.2847, 36.8208),
+    "Railways Stage": (-1.2847, 36.8278),
+    "Afya Centre": (-1.2875, 36.8194),
+    "Muthurwa Market": (-1.2903, 36.8264),
+    
+    # Markets
+    "City Market": (-1.2819, 36.8181),
+    "Wakulima Market": (-1.2903, 36.8250),
+    "Gikomba Market": (-1.2875, 36.8306),
+    "Maasai Market": (-1.2847, 36.8194),
+    "Muthurwa Market": (-1.2903, 36.8264),
+    
+    # Residential Areas
+    "Runda": (-1.2042, 36.8028),
+    "Muthaiga": (-1.2375, 36.8139),
+    "Gigiri": (-1.2208, 36.8111),
+    "Ridgeways": (-1.2125, 36.8167),
+    "Loresho": (-1.2458, 36.7944),
+    "Riverside": (-1.2708, 36.8000),
+    "Milimani": (-1.2792, 36.8056),
+    "Upper Hill": (-1.2931, 36.8125),
+    "Kirichwa Road": (-1.2958, 36.8069),
+    "State House Road": (-1.2875, 36.8056),
+    
+    # Satellite Towns
+    "Ruiru": (-1.1458, 36.9583),
+    "Kikuyu": (-1.2458, 36.6667),
+    "Limuru": (-1.1167, 36.6417),
+    "Kiambu": (-1.1714, 36.8356),
+    "Thika": (-1.0333, 36.8667),
+    "Machakos": (-1.5167, 37.2667),
+    "Athi River": (-1.4500, 36.9833),
+    
+    # Other Notable Areas
+    "Adams Arcade": (-1.3097, 36.7806),
+    "Ngara": (-1.2625, 36.8306),
+    "Pangani": (-1.2542, 36.8389),
+    "Shauri Moyo": (-1.2708, 36.8389),
+    "Ziwani": (-1.2736, 36.8417),
+    "Kariokor": (-1.2708, 36.8333),
+    "Bahati": (-1.2653, 36.8361),
+    "California": (-1.2597, 36.8417),
+    "Baba Dogo": (-1.2375, 36.8806),
+    "Lucky Summer": (-1.2208, 36.8778),
+    "Dandora": (-1.2458, 36.8972),
+    "Kariobangi South": (-1.2681, 36.8833),
+    "Kariobangi North": (-1.2625, 36.8861),
+    "Buruburu": (-1.2875, 36.8750),
+    "Jericho": (-1.2792, 36.8694),
+    "Ofafa Jericho": (-1.2819, 36.8722),
+    "Makadara": (-1.2958, 36.8583),
+    "Harambee": (-1.2931, 36.8611),
+    "Maringo": (-1.2903, 36.8556),
+    "Kaloleni": (-1.2875, 36.8528),
+    "Starehe": (-1.2792, 36.8361),
+    "Pumwani": (-1.2736, 36.8361),
+    "Eastleigh Airbase": (-1.2625, 36.8500),
+    "Moi Air Base": (-1.2625, 36.8528)
 }
-
 # Initialize session state
 if 'prediction_results' not in st.session_state:
     st.session_state.prediction_results = None
@@ -352,90 +554,123 @@ model, label_encoder = load_models()
 
 if df is not None:
     df = preprocess_data(df)
-    st.success(f"✅ Loaded {len(df):,} crash records")
 
 # Title and header
-st.title("🚗 Nairobi Road Crash Risk Prediction Dashboard")
-st.markdown("### Advanced AI-Powered Road Safety Analysis System")
-st.markdown("---")
+#st.title("🚗 Nairobi Road Crash Risk Prediction & Hotspot Analysis Dashboard")
+#st.markdown("---")
 
 # Sidebar navigation
-st.sidebar.header("🧭 Navigation")
+st.sidebar.header("Navigation")
 page = st.sidebar.selectbox("Choose a page:", 
-    ["🏠 Home", "🎯 Prediction", "📊 Analytics", "🗺️ Hotspots", "📋 History", "ℹ️ About"])
+    ["Home", "Prediction", "Route Analysis", "Analytics", "Hotspots", "History", "About"])
 
-if page == "🏠 Home":
-    st.header("Welcome to Nairobi Crash Risk Predictor")
+from datetime import datetime
+
+# Time-based personalized greeting
+hour = datetime.now().hour
+if hour < 12:
+    greeting = "Good morning"
+elif hour < 17:
+    greeting = "Good afternoon"
+else:
+    greeting = "Good evening"
+
+# HOME PAGE
+if page == "Home":
+    st.title("Nairobi Road Crash Risk & Hotspot Analysis")
     
-    col1, col2, col3, col4 = st.columns(4)
-    
+    st.markdown(f"### {greeting}, welcome to your Road Safety Assistant")
+    st.markdown("Make informed travel decisions using AI-powered crash risk predictions.")
+
+    st.markdown("---")
+
+    # Quick Start Guide
+    st.subheader("Quick Start")
+    st.markdown("""
+    1. **Prediction** – Get crash risk for any location & time.  
+    2. **Hotspots** – Explore Nairobi's high-risk crash zones.  
+    3. **Analytics** – See patterns & trends in crash data.  
+    """)
+
+    st.markdown("---")
+
+    # Brief Overview
+    col1, col2 = st.columns([2, 1])
     with col1:
-        st.metric("Total Crashes", f"{len(df):,}" if df is not None else "N/A")
-    
+        st.markdown("""
+        ### Why This App?
+
+        - Predict crash risk instantly.  
+        - Check route safety before you leave.  
+        - Discover Nairobi's crash hotspots.  
+        - Use data to protect yourself & others.  
+        """)
     with col2:
         if df is not None:
-            severe_crashes = len(df[df['severity_category'] == 'Severe'])
-            st.metric("Severe Crashes", f"{severe_crashes:,}")
-        else:
-            st.metric("Severe Crashes", "N/A")
-    
-    with col3:
-        st.metric("Models Loaded", "✅" if model is not None else "❌")
-    
-    with col4:
-        st.metric("Predictions Made", len(st.session_state.user_history))
-    
-    st.markdown("""
-    ### 🎯 What This App Does:
-    - **Predicts crash risk** using advanced machine learning models
-    - **Identifies hotspots** using clustering algorithms
-    - **Provides safety recommendations** based on real-time analysis
-    - **Analyzes crash patterns** with interactive visualizations
-    - **Generates detailed reports** for risk assessment
-    
-    ### 📋 How to Use:
-    1. **Prediction**: Get instant risk assessments for any location and time
-    2. **Analytics**: Explore crash patterns and trends
-    3. **Hotspots**: Discover dangerous areas with advanced clustering
-    4. **History**: Review your previous predictions
-    5. **Reports**: Download detailed risk assessment reports
-    
-    ### 🚀 New Features:
-    - Dynamic risk scoring with multiple factors
-    - Advanced hotspot detection using DBSCAN clustering
-    - Enhanced analytics with heatmaps and trends
-    - User history and report generation
-    - Improved mobile-responsive design
-    """)
-    
-    if df is not None:
-        # Quick stats
-        st.subheader("📊 Quick Statistics")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            peak_hour = df['crash_hour'].mode()[0]
-            st.info(f"🕐 Peak crash hour: **{peak_hour}:00**")
-        
-        with col2:
-            weekend_crashes = len(df[df['weekend'] == 1])
-            weekday_crashes = len(df[df['weekend'] == 0])
-            if weekend_crashes > weekday_crashes:
-                st.warning("📅 **Weekends** are more dangerous")
-            else:
-                st.info("📅 **Weekdays** have more crashes")
-        
-        with col3:
-            severe_rate = len(df[df['severity_category'] == 'Severe']) / len(df) * 100
-            st.error(f"🚨 Severe crash rate: **{severe_rate:.1f}%**")
+            total = len(df)
+            severe = len(df[df['severity_category'] == 'Severe'])
+            st.info(f"""
+            **Data Analyzed**  
+            {total:,} total crashes  
+            {severe:,} severe cases  
+            85%+ model accuracy
+            """)
 
-elif page == "🎯 Prediction":
+    st.markdown("---")
+
+    # Features Summary
+    st.subheader("Key Features")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.markdown("**Crash Prediction**\n\nEstimate crash risk by time & location.")
+    with col2:
+        st.markdown("**Hotspot Maps**\n\nFind crash-prone areas across Nairobi.")
+    with col3:
+        st.markdown("**Route Risk Check**\n\nPlan safer routes using risk insights.")
+
+    st.markdown("---")
+
+    # System Status
+    st.subheader("System Stats")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Crashes", f"{len(df):,}" if df is not None else "N/A")
+    with col2:
+        if df is not None:
+            sev = len(df[df['severity_category'] == 'Severe'])
+            pct = (sev / len(df) * 100) if len(df) > 0 else 0
+            st.metric("Severe", f"{sev:,}", f"{pct:.1f}%")
+        else:
+            st.metric("Severe", "N/A")
+    with col3:
+        st.metric("Model", "Ready" if model else "Error")
+    with col4:
+        st.metric("Your Runs", f"{len(st.session_state.user_history):,}")
+
+    st.markdown("---")
+
+    # Navigation Buttons
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("Predict", type="primary"):
+            st.session_state.page = "Prediction"
+            st.rerun()
+    with c2:
+        if st.button("Hotspots"):
+            st.session_state.page = "Hotspots"
+            st.rerun()
+    with c3:
+        if st.button("Analytics"):
+            st.session_state.page = "Analytics"
+            st.rerun()
+
+
+elif page == "Prediction":
     st.header("🎯 Advanced Crash Risk Prediction")
     
     if model is None or label_encoder is None:
         st.error("❌ Models not loaded. Please check your model files.")
     else:
-        st.success("✅ Ready for predictions!")
         
         # Input form
         col1, col2 = st.columns(2)
@@ -572,14 +807,15 @@ elif page == "🎯 Prediction":
                 st.info(f"📊 **Confidence: {results['confidence']:.1%}**")
             
             with col_result3:
-                if results['risk_color'] == 'red':
-                    st.error(f"**{results['risk_level']}**")
-                elif results['risk_color'] == 'orange':
-                    st.warning(f"**{results['risk_level']}**")
-                elif results['risk_color'] == 'yellow':
-                    st.warning(f"**{results['risk_level']}**")
+                risk_level = results['risk_level']
+                if "EXTREME" in risk_level:
+                    st.error(f"🔴 **{risk_level}**")
+                elif "HIGH" in risk_level:
+                    st.warning(f"🟠 **{risk_level}**")
+                elif "MODERATE" in risk_level:
+                    st.warning(f"🟡 **{risk_level}**")
                 else:
-                    st.success(f"**{results['risk_level']}**")
+                    st.success(f"🟢 **{risk_level}**")
             
             # Detailed analysis
             col_detail1, col_detail2 = st.columns(2)
@@ -602,6 +838,17 @@ elif page == "🎯 Prediction":
                              'threshold': {'line': {'color': "black", 'width': 4},
                                           'thickness': 0.75, 'value': 8}}))
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # Risk score description
+                st.markdown("""
+                **How to Read the Dynamic Risk Score:**
+                - **0-3**: 🟢 LOW RISK - Relatively safe conditions
+                - **3-5**: 🟡 MODERATE RISK - Exercise normal caution  
+                - **5-7**: 🟠 HIGH RISK - Increased vigilance required
+                - **7-10**: 🔴 EXTREME RISK - Maximum caution needed
+                
+                The score considers predicted severity, model confidence, nearby crashes, and traffic conditions.
+                """)
                 
                 # Probability distribution
                 prob_df = pd.DataFrame({
@@ -687,227 +934,474 @@ elif page == "🎯 Prediction":
                     del st.session_state.found_location
                 st.rerun()
 
-elif page == "📊 Analytics":
-    st.header("📊 Advanced Crash Analytics Dashboard")
+elif page == "Route Analysis":
+    st.header("🛣️ Advanced Route Risk Analysis")
+    
+    if model is None or df is None:
+        st.error("❌ Models or data not loaded.")
+    else:
+        st.write("Analyze crash risk along your planned route with temporal factors")
+        
+        # Date and Time Selection
+        st.subheader("📅 Journey Details")
+        col_dt1, col_dt2 = st.columns(2)
+        
+        with col_dt1:
+            route_date = st.date_input("Journey Date", datetime.now().date(), key="route_date")
+        with col_dt2:
+            route_time = st.time_input("Journey Time", time(12, 0), key="route_time")
+        
+        # Location Selection
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("🚀 Starting Location")
+            start_method = st.radio("Choose start location method:", 
+                                   ["Quick Select", "Search", "Use My Location", "Coordinates"], key="start")
+            
+            if start_method == "Quick Select":
+                start_location = st.selectbox("Select starting location:", 
+                                            list(NAIROBI_LOCATIONS.keys()), key="start_select")
+                start_lat, start_lon = NAIROBI_LOCATIONS[start_location]
+                start_address = start_location
+                
+            elif start_method == "Use My Location":
+                st.info("📍 Click button to get your current location")
+                if st.button("📍 Get My Current Location", key="get_start_location"):
+                    st.info("🔄 Location detection would require browser permissions. Using default Nairobi center.")
+                    start_lat, start_lon, start_address = -1.286389, 36.817222, "Nairobi City Center (Default)"
+                else:
+                    start_lat, start_lon, start_address = -1.286389, 36.817222, "Nairobi City Center (Default)"
+                    
+            elif start_method == "Search":
+                start_name = st.text_input("Enter starting location:", key="start_search")
+                if start_name and st.button("🔍 Find Start Location"):
+                    with st.spinner("Searching..."):
+                        lat, lon, address = get_coordinates_from_location(start_name)
+                        if lat and lon:
+                            start_lat, start_lon, start_address = lat, lon, address
+                            st.success(f"✅ Found: {address}")
+                        else:
+                            st.error("❌ Location not found")
+                            start_lat, start_lon, start_address = -1.286389, 36.817222, "Default"
+                else:
+                    start_lat, start_lon, start_address = -1.286389, 36.817222, "Default"
+            else:
+                start_lat = st.number_input("Start Latitude", value=-1.286389, format="%.6f", key="start_lat")
+                start_lon = st.number_input("Start Longitude", value=36.817222, format="%.6f", key="start_lon")
+                start_address = f"({start_lat:.4f}, {start_lon:.4f})"
+        
+        with col2:
+            st.subheader("🎯 Destination")
+            end_method = st.radio("Choose destination method:", 
+                                 ["Quick Select", "Search", "Use My Location", "Coordinates"], key="end")
+            
+            if end_method == "Quick Select":
+                end_location = st.selectbox("Select destination:", 
+                                          list(NAIROBI_LOCATIONS.keys()), key="end_select")
+                end_lat, end_lon = NAIROBI_LOCATIONS[end_location]
+                end_address = end_location
+                
+            elif end_method == "Use My Location":
+                st.info("📍 Click button to get your current location")
+                if st.button("📍 Get My Current Location", key="get_end_location"):
+                    st.info("🔄 Location detection would require browser permissions. Using default location.")
+                    end_lat, end_lon, end_address = -1.3197, 36.7085, "Karen (Default)"
+                else:
+                    end_lat, end_lon, end_address = -1.3197, 36.7085, "Karen (Default)"
+                    
+            elif end_method == "Search":
+                end_name = st.text_input("Enter destination:", key="end_search")
+                if end_name and st.button("🔍 Find Destination"):
+                    with st.spinner("Searching..."):
+                        lat, lon, address = get_coordinates_from_location(end_name)
+                        if lat and lon:
+                            end_lat, end_lon, end_address = lat, lon, address
+                            st.success(f"✅ Found: {address}")
+                        else:
+                            st.error("❌ Location not found")
+                            end_lat, end_lon, end_address = -1.3197, 36.7085, "Default"
+                else:
+                    end_lat, end_lon, end_address = -1.3197, 36.7085, "Default"
+            else:
+                end_lat = st.number_input("End Latitude", value=-1.3197, format="%.6f", key="end_lat")
+                end_lon = st.number_input("End Longitude", value=36.7085, format="%.6f", key="end_lon")
+                end_address = f"({end_lat:.4f}, {end_lon:.4f})"
+        
+        # Route Summary
+        st.info(f"🛣️ **Route:** {start_address} → {end_address}")
+        st.info(f"📅 **Journey:** {route_date} at {route_time}")
+        
+        if st.button("🔍 Analyze Route Risk", type="primary"):
+            with st.spinner("Analyzing route risk with temporal factors..."):
+                # Calculate temporal factors
+                hour = route_time.hour
+                day_of_week = route_date.weekday()
+                month = route_date.month
+                rush_hour = 1 if (7 <= hour <= 9) or (16 <= hour <= 19) else 0
+                weekend = 1 if day_of_week >= 5 else 0
+                night_time = 1 if hour >= 22 or hour <= 5 else 0
+                
+                # Calculate route points and risks
+                route_points, route_risks = calculate_route_risk(df, start_lat, start_lon, end_lat, end_lon)
+                
+                # Generate predictions for each route point
+                route_predictions = []
+                for i, ((lat, lon), historical_risk) in enumerate(zip(route_points, route_risks)):
+                    features = np.array([[hour, day_of_week, month, lat, lon, rush_hour, weekend, night_time]])
+                    prediction = model.predict(features)[0]
+                    probabilities = model.predict_proba(features)[0]
+                    severity = label_encoder.inverse_transform([prediction])[0]
+                    confidence = max(probabilities)
+                    
+                    nearby_crashes = get_nearby_crashes(df, lat, lon, radius_km=1)
+                    traffic_factor = get_traffic_risk_factor(hour, day_of_week)
+                    risk_score = calculate_dynamic_risk_score(severity, confidence, nearby_crashes, traffic_factor=traffic_factor)
+                    
+                    route_predictions.append({
+                        'point': i + 1,
+                        'lat': lat,
+                        'lon': lon,
+                        'severity': severity,
+                        'confidence': confidence,
+                        'risk_score': risk_score,
+                        'historical_risk': historical_risk,
+                        'nearby_crashes': len(nearby_crashes)
+                    })
+                
+                # Store route analysis in session state
+                route_analysis = {
+                    'timestamp': datetime.now(),
+                    'start_address': start_address,
+                    'end_address': end_address,
+                    'journey_date': route_date,
+                    'journey_time': route_time,
+                    'route_points': route_predictions,
+                    'temporal_factors': {
+                        'hour': hour,
+                        'rush_hour': rush_hour,
+                        'weekend': weekend,
+                        'night_time': night_time
+                    }
+                }
+                
+                # Initialize route history if not exists
+                if 'route_history' not in st.session_state:
+                    st.session_state.route_history = []
+                
+                st.session_state.route_history.append(route_analysis)
+                st.session_state.current_route_analysis = route_analysis
+                
+                # Keep only last 20 route analyses
+                if len(st.session_state.route_history) > 20:
+                    st.session_state.route_history = st.session_state.route_history[-20:]
+        
+        # Display results if available
+        if 'current_route_analysis' in st.session_state:
+            analysis = st.session_state.current_route_analysis
+            predictions = analysis['route_points']
+            
+            # Route statistics
+            avg_risk = np.mean([p['risk_score'] for p in predictions])
+            max_risk = np.max([p['risk_score'] for p in predictions])
+            high_risk_segments = sum(1 for p in predictions if p['risk_score'] > 5)
+            severe_predictions = sum(1 for p in predictions if p['severity'] == 'Severe')
+            
+            st.subheader("📊 Route Risk Analysis Results")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Average Risk Score", f"{avg_risk:.1f}/10")
+            with col2:
+                st.metric("Maximum Risk Point", f"{max_risk:.1f}/10")
+            with col3:
+                st.metric("High Risk Segments", high_risk_segments)
+            with col4:
+                st.metric("Severe Predictions", severe_predictions)
+            
+            # Temporal context
+            factors = analysis['temporal_factors']
+            context_info = []
+            if factors['rush_hour']:
+                context_info.append("🚦 Rush Hour")
+            if factors['weekend']:
+                context_info.append("📅 Weekend")
+            if factors['night_time']:
+                context_info.append("🌙 Night Time")
+            
+            if context_info:
+                st.info(f"**Journey Context:** {' | '.join(context_info)}")
+            
+            # Route predictions table
+            st.subheader("🎯 Point-by-Point Predictions")
+            
+            pred_df = pd.DataFrame(predictions)
+            pred_df['risk_level'] = pred_df['risk_score'].apply(lambda x: get_risk_level(x)[0])
+            
+            # Style the dataframe
+            def style_risk(val):
+                if val >= 7:
+                    return 'background-color: #ffebee'
+                elif val >= 5:
+                    return 'background-color: #fff3e0'
+                elif val >= 3:
+                    return 'background-color: #fffde7'
+                else:
+                    return 'background-color: #e8f5e8'
+            
+            styled_pred_df = pred_df[['point', 'severity', 'confidence', 'risk_score', 'risk_level', 'nearby_crashes']].style.applymap(style_risk, subset=['risk_score'])
+            st.dataframe(styled_pred_df, use_container_width=True)
+            
+            # Route map with predictions
+            st.subheader("🗺️ Interactive Route Risk Map")
+            
+            route_center_lat = (start_lat + end_lat) / 2
+            route_center_lon = (start_lon + end_lon) / 2
+            m = folium.Map(location=[route_center_lat, route_center_lon], zoom_start=12)
+            
+            # Add start and end markers
+            folium.Marker([start_lat, start_lon], popup=f"🚀 Start: {start_address}", 
+                        icon=folium.Icon(color='green', icon='play')).add_to(m)
+            folium.Marker([end_lat, end_lon], popup=f"🎯 End: {end_address}", 
+                        icon=folium.Icon(color='red', icon='stop')).add_to(m)
+            
+            # Add route points with risk-based colors
+            for pred in predictions:
+                risk_score = pred['risk_score']
+                if risk_score >= 7:
+                    color = 'red'
+                elif risk_score >= 5:
+                    color = 'orange'
+                elif risk_score >= 3:
+                    color = 'yellow'
+                else:
+                    color = 'green'
+                
+                folium.CircleMarker(
+                    [pred['lat'], pred['lon']],
+                    radius=8,
+                    color=color,
+                    fill=True,
+                    popup=f"Point {pred['point']}<br>Severity: {pred['severity']}<br>Risk Score: {pred['risk_score']:.1f}<br>Confidence: {pred['confidence']:.1%}<br>Nearby Crashes: {pred['nearby_crashes']}"
+                ).add_to(m)
+            
+            # Add route line
+            route_coords = [[p['lat'], p['lon']] for p in predictions]
+            folium.PolyLine(route_coords, color='blue', weight=3, opacity=0.7).add_to(m)
+            
+            st_folium(m, width=700, height=400)
+            
+            # Overall recommendations
+            st.subheader("🛡️ Route Safety Recommendations")
+            
+            if avg_risk >= 6:
+                st.error("🚨 **HIGH RISK ROUTE** - Consider alternative route or time")
+                st.write("• Plan alternative route if possible")
+                st.write("• Consider traveling at different time")
+                st.write("• Exercise maximum caution")
+            elif avg_risk >= 4:
+                st.warning("⚠️ **MODERATE RISK ROUTE** - Exercise caution")
+                st.write("• Drive defensively")
+                st.write("• Maintain safe following distance")
+                st.write("• Be extra alert in high-risk segments")
+            else:
+                st.success("✅ **RELATIVELY SAFE ROUTE**")
+                st.write("• Maintain normal safety precautions")
+                st.write("• Stay alert for changing conditions")
+            
+            if factors['rush_hour']:
+                st.write("• 🚦 Rush hour traffic - expect delays and increased risk")
+            if factors['night_time']:
+                st.write("• 🌙 Night driving - ensure good visibility and reduce speed")
+            if factors['weekend']:
+                st.write("• 📅 Weekend travel - watch for recreational traffic patterns")
+            
+            # Export route analysis
+            st.subheader("📄 Export Route Analysis")
+            
+            route_report = f"""NAIROBI ROUTE RISK ANALYSIS REPORT
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+ROUTE DETAILS:
+- From: {analysis['start_address']}
+- To: {analysis['end_address']}
+- Journey Date: {analysis['journey_date']}
+- Journey Time: {analysis['journey_time']}
+
+RISK SUMMARY:
+- Average Risk Score: {avg_risk:.1f}/10
+- Maximum Risk Point: {max_risk:.1f}/10
+- High Risk Segments: {high_risk_segments}
+- Severe Predictions: {severe_predictions}
+
+TEMPORAL FACTORS:
+- Rush Hour: {'Yes' if factors['rush_hour'] else 'No'}
+- Weekend: {'Yes' if factors['weekend'] else 'No'}
+- Night Time: {'Yes' if factors['night_time'] else 'No'}
+
+POINT-BY-POINT ANALYSIS:
+"""
+            for pred in predictions:
+                route_report += f"Point {pred['point']}: {pred['severity']} (Risk: {pred['risk_score']:.1f}, Confidence: {pred['confidence']:.1%})\n"
+            
+            route_report += "\nDISCLAIMER: This analysis is based on historical data and machine learning predictions. Always drive according to current conditions."
+            
+            st.download_button(
+                label="📥 Download Route Analysis Report",
+                data=route_report,
+                file_name=f"route_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain"
+            )
+            
+            # Clear results button
+            if st.button("🔄 Clear Results & Analyze New Route"):
+                if 'current_route_analysis' in st.session_state:
+                    del st.session_state.current_route_analysis
+                st.rerun()
+
+elif page == "Analytics":
+    st.header("Advanced Crash Analytics Dashboard")
     
     if df is not None:
         # Time-based analysis
-        st.subheader("⏰ Temporal Analysis")
+        st.subheader("Temporal Patterns")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            # Hourly heatmap
-            hourly_daily = df.pivot_table(
-                values='crash_datetime', 
-                index='crash_dayofweek', 
-                columns='crash_hour', 
-                aggfunc='count', 
-                fill_value=0
-            )
-            
-            day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            fig = px.imshow(
-                hourly_daily.values,
-                x=list(range(24)),
-                y=day_names,
-                title="Crash Frequency Heatmap (Hour vs Day)",
-                color_continuous_scale='Reds',
-                labels={'x': 'Hour of Day', 'y': 'Day of Week', 'color': 'Crashes'}
-            )
+            # Hourly distribution
+            hourly_crashes = df.groupby('crash_hour').size()
+            fig = px.bar(x=hourly_crashes.index, y=hourly_crashes.values,
+                        title="Crashes by Hour of Day",
+                        labels={'x': 'Hour', 'y': 'Number of Crashes'})
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            # Severity trends over time
-            monthly_severity = df.groupby(['crash_month', 'severity_category']).size().unstack(fill_value=0)
-            fig = px.line(
-                monthly_severity,
-                title="Monthly Severity Trends",
-                labels={'index': 'Month', 'value': 'Number of Crashes'}
-            )
+            # Day of week distribution
+            day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            daily_crashes = df.groupby('crash_dayofweek').size()
+            fig = px.bar(x=[day_names[i] for i in daily_crashes.index], y=daily_crashes.values,
+                        title="Crashes by Day of Week",
+                        labels={'x': 'Day', 'y': 'Number of Crashes'})
             st.plotly_chart(fig, use_container_width=True)
         
-        # Geographic analysis
-        st.subheader("🗺️ Geographic Risk Analysis")
+        # Severity analysis
+        st.subheader("Severity Analysis")
         
-        col3, col4 = st.columns(2)
+        col1, col2 = st.columns(2)
         
-        with col3:
-            # Hourly crashes
-            hourly = df['crash_hour'].value_counts().sort_index()
-            fig = px.line(x=hourly.index, y=hourly.values, 
-                         title="Crashes by Hour of Day",
-                         labels={'x': 'Hour', 'y': 'Number of Crashes'})
-            fig.add_vline(x=8, line_dash="dash", line_color="red", annotation_text="Morning Rush")
-            fig.add_vline(x=17, line_dash="dash", line_color="red", annotation_text="Evening Rush")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col4:
+        with col1:
             # Severity distribution
             severity_counts = df['severity_category'].value_counts()
             fig = px.pie(values=severity_counts.values, names=severity_counts.index,
-                        title="Crash Severity Distribution",
-                        color_discrete_map={
-                            'Severe': 'red',
-                            'Moderate': 'orange',
-                            'Minor': 'yellow',
-                            'No_Injury': 'green'
-                        })
+                        title="Crash Severity Distribution")
             st.plotly_chart(fig, use_container_width=True)
         
-        # Additional analytics
-        col5, col6 = st.columns(2)
-        
-        with col5:
-            # Day of week distribution
-            day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-            daily_crashes = df['crash_dayofweek'].value_counts().sort_index()
-            fig = px.bar(x=[day_names[i] for i in daily_crashes.index], 
-                        y=daily_crashes.values,
-                        title="Crashes by Day of Week",
-                        labels={'x': 'Day of Week', 'y': 'Number of Crashes'},
-                        color=daily_crashes.values,
-                        color_continuous_scale='Reds')
+        with col2:
+            # Severity by hour
+            severity_hour = df.groupby(['crash_hour', 'severity_category']).size().unstack(fill_value=0)
+            fig = px.bar(severity_hour, title="Severity Distribution by Hour",
+                        labels={'index': 'Hour', 'value': 'Number of Crashes'})
             st.plotly_chart(fig, use_container_width=True)
         
-        with col6:
-            # Monthly distribution
-            monthly_crashes = df['crash_month'].value_counts().sort_index()
-            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
-                          'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-            fig = px.bar(x=[month_names[i-1] for i in monthly_crashes.index], 
-                        y=monthly_crashes.values,
-                        title="Crashes by Month",
-                        labels={'x': 'Month', 'y': 'Number of Crashes'},
-                        color=monthly_crashes.values,
-                        color_continuous_scale='Reds')
-            st.plotly_chart(fig, use_container_width=True)
+        # Vehicle involvement
+        st.subheader("Vehicle Involvement Analysis")
         
-        # Key statistics
-        st.subheader("📈 Key Insights")
-        col7, col8, col9, col10 = st.columns(4)
+        vehicle_stats = {
+            'Pedestrian': df['pedestrian_involved'].sum(),
+            'Matatu': df['matatu_involved'].sum(),
+            'Motorcycle': df['motorcycle_involved'].sum(),
+            'Fatal': df['fatal_crash'].sum()
+        }
         
-        with col7:
-            peak_hour = df['crash_hour'].mode()[0]
-            st.metric("Peak Crash Hour", f"{peak_hour}:00")
-        
-        with col8:
-            rush_hour_crashes = len(df[df['rush_hour'] == 1])
-            rush_hour_rate = rush_hour_crashes / len(df) * 100
-            st.metric("Rush Hour Crashes", f"{rush_hour_crashes:,}", f"{rush_hour_rate:.1f}%")
-        
-        with col9:
-            weekend_crashes = len(df[df['weekend'] == 1])
-            weekend_rate = weekend_crashes / len(df) * 100
-            st.metric("Weekend Crashes", f"{weekend_crashes:,}", f"{weekend_rate:.1f}%")
-        
-        with col10:
-            night_crashes = len(df[df['night_time'] == 1])
-            night_rate = night_crashes / len(df) * 100
-            st.metric("Night Time Crashes", f"{night_crashes:,}", f"{night_rate:.1f}%")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Pedestrian Involved", vehicle_stats['Pedestrian'])
+        with col2:
+            st.metric("Matatu Involved", vehicle_stats['Matatu'])
+        with col3:
+            st.metric("Motorcycle Involved", vehicle_stats['Motorcycle'])
+        with col4:
+            st.metric("Fatal Crashes", vehicle_stats['Fatal'])
         
         # Predictive insights
-        st.subheader("🔮 Predictive Insights")
+        st.subheader("Predictive Insights")
         
         col11, col12, col13 = st.columns(3)
         
         with col11:
             # Most dangerous hour
             dangerous_hour = df[df['severity_category'] == 'Severe']['crash_hour'].mode()[0]
-            st.error(f"🕐 Most dangerous hour: **{dangerous_hour}:00**")
+            st.error(f"Most dangerous hour: **{dangerous_hour}:00**")
         
         with col12:
-            # Weekend vs weekday risk
+            # Weekend vs weekday
             weekend_severe = len(df[(df['weekend'] == 1) & (df['severity_category'] == 'Severe')])
             weekday_severe = len(df[(df['weekend'] == 0) & (df['severity_category'] == 'Severe')])
-            weekend_risk = weekend_severe / len(df[df['weekend'] == 1]) if len(df[df['weekend'] == 1]) > 0 else 0
-            weekday_risk = weekday_severe / len(df[df['weekend'] == 0]) if len(df[df['weekend'] == 0]) > 0 else 0
-            
-            if weekend_risk > weekday_risk:
-                st.warning(f"📅 Weekends are **{((weekend_risk/weekday_risk-1)*100):.1f}%** more dangerous")
+            if weekend_severe > weekday_severe:
+                st.warning("**Weekends** more dangerous")
             else:
-                st.info(f"📅 Weekdays have **{((weekday_risk/weekend_risk-1)*100):.1f}%** higher severe risk")
+                st.info("**Weekdays** more dangerous")
         
         with col13:
             # Rush hour impact
             rush_severe = len(df[(df['rush_hour'] == 1) & (df['severity_category'] == 'Severe')])
             rush_risk = rush_severe / len(df[df['rush_hour'] == 1]) if len(df[df['rush_hour'] == 1]) > 0 else 0
-            st.warning(f"🚦 Rush hour severe risk: **{rush_risk*100:.1f}%**")
+            st.warning(f"Rush hour severe risk: **{rush_risk*100:.1f}%**")
     
     else:
         st.error("❌ No data available for analytics")
 
-elif page == "🗺️ Hotspots":
-    st.header("🗺️ Advanced Crash Hotspot Analysis")
+elif page == "Hotspots":
+    st.header("🗺️ Crash Hotspot Analysis")
     
     if df is not None:
-        # Hotspot detection controls
-        st.subheader("🔧 Hotspot Detection Parameters")
-        col1, col2, col3 = st.columns(3)
+        # Simplified controls in a single row
+        st.subheader("Detection Settings")
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
         
         with col1:
-            eps_km = st.slider("Hotspot Radius (km)", 0.1, 2.0, 0.5, 0.1,
-                              help="Radius for grouping nearby crashes into hotspots")
+            eps_km = st.slider("Radius (km)", 0.1, 2.0, 0.5, 0.1)
         with col2:
-            min_samples = st.slider("Min Crashes per Hotspot", 3, 20, 5,
-                                   help="Minimum number of crashes to form a hotspot")
+            min_samples = st.slider("Min Crashes", 3, 20, 5)
         with col3:
-            severity_filter = st.selectbox("Filter by Severity", 
+            severity_filter = st.selectbox("Severity Filter", 
                                          ["All", "Severe", "Moderate", "Minor"])
+        with col4:
+            st.write("")  # spacing
+            detect_btn = st.button("🔍 Detect", type="primary")
         
-        # Filter data if needed
+        # Filter data
         filtered_df = df.copy()
         if severity_filter != "All":
             filtered_df = df[df['severity_category'] == severity_filter]
         
-        # Detect hotspots
-        with st.spinner("Detecting crash hotspots..."):
-            hotspots_df = detect_crash_hotspots(filtered_df, eps_km, min_samples)
+        # Auto-detect or manual detect
+        if detect_btn or 'hotspots_df' not in st.session_state:
+            with st.spinner("Analyzing hotspots..."):
+                hotspots_df = detect_crash_hotspots(filtered_df, eps_km, min_samples)
+                st.session_state.hotspots_df = hotspots_df
+        else:
+            hotspots_df = st.session_state.hotspots_df
         
         if len(hotspots_df) > 0:
-            # Display hotspot statistics
-            st.subheader("📊 Hotspot Statistics")
-            col1, col2, col3, col4 = st.columns(4)
+            st.success(f"✅ Found {len(hotspots_df)} hotspots")
             
+            # Key metrics in cards
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
-                st.metric("Total Hotspots", len(hotspots_df))
+                st.metric("🎯 Total Hotspots", len(hotspots_df))
             with col2:
-                high_risk_hotspots = len(hotspots_df[hotspots_df['risk_score'] > 0.5])
-                st.metric("High Risk Hotspots", high_risk_hotspots)
+                high_risk = len(hotspots_df[hotspots_df['risk_score'] > 0.5])
+                st.metric("🔴 High Risk", high_risk)
             with col3:
-                total_crashes_in_hotspots = hotspots_df['crash_count'].sum()
-                st.metric("Crashes in Hotspots", total_crashes_in_hotspots)
+                total_crashes = hotspots_df['crash_count'].sum()
+                st.metric("💥 Total Crashes", total_crashes)
             with col4:
                 avg_risk = hotspots_df['risk_score'].mean()
-                st.metric("Average Risk Score", f"{avg_risk:.2f}")
+                st.metric("📊 Avg Risk", f"{avg_risk:.2f}")
             
-            # Top 10 most dangerous hotspots
-            st.subheader("🚨 Top 10 Most Dangerous Hotspots")
-            top_hotspots = hotspots_df.head(10)
-            
-            for idx, hotspot in top_hotspots.iterrows():
-                risk_color = "🔴" if hotspot['risk_score'] > 0.7 else "🟠" if hotspot['risk_score'] > 0.4 else "🟡"
-                
-                with st.expander(f"{risk_color} Hotspot #{hotspot['cluster_id']+1} - Risk Score: {hotspot['risk_score']:.2f}"):
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.write(f"📍 **Location:** {hotspot['center_lat']:.6f}, {hotspot['center_lon']:.6f}")
-                        st.write(f"💥 **Total Crashes:** {hotspot['crash_count']}")
-                        st.write(f"🚨 **Severe Crashes:** {hotspot['severe_count']}")
-                    with col2:
-                        st.write(f"⚠️ **Risk Score:** {hotspot['risk_score']:.2f}")
-                        risk_percentage = hotspot['risk_score'] * 100
-                        st.write(f"📊 **Severity Rate:** {risk_percentage:.1f}%")
-                        
-                        # Risk level
-                        if hotspot['risk_score'] > 0.7:
-                            st.error("🔴 EXTREME DANGER ZONE")
-                        elif hotspot['risk_score'] > 0.4:
-                            st.warning("🟠 HIGH RISK AREA")
-                        else:
-                            st.info("🟡 MODERATE RISK AREA")
-            
-            # Interactive map with hotspots
+            # Interactive map first (most important)
             st.subheader("🗺️ Interactive Hotspot Map")
             
             valid_coords = filtered_df.dropna(subset=['latitude', 'longitude'])
@@ -917,163 +1411,112 @@ elif page == "🗺️ Hotspots":
                 
                 m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
                 
-                # Add hotspot circles
+                # Add hotspots with better styling
                 for _, hotspot in hotspots_df.iterrows():
-                    # Color based on risk score
                     if hotspot['risk_score'] > 0.7:
-                        color = 'red'
-                        fillColor = 'red'
+                        color, icon = 'red', '⚠️'
                     elif hotspot['risk_score'] > 0.4:
-                        color = 'orange'
-                        fillColor = 'orange'
+                        color, icon = 'orange', '⚡'
                     else:
-                        color = 'yellow'
-                        fillColor = 'yellow'
-                    
-                    folium.Circle(
-                        location=[hotspot['center_lat'], hotspot['center_lon']],
-                        radius=eps_km * 1000,
-                        color=color,
-                        fill=True,
-                        fillColor=fillColor,
-                        fillOpacity=0.3,
-                        popup=f"<b>Hotspot #{hotspot['cluster_id']+1}</b><br>"
-                              f"Crashes: {hotspot['crash_count']}<br>"
-                              f"Severe: {hotspot['severe_count']}<br>"
-                              f"Risk Score: {hotspot['risk_score']:.2f}<br>"
-                              f"Severity Rate: {hotspot['risk_score']*100:.1f}%",
-                        tooltip=f"Hotspot #{hotspot['cluster_id']+1} (Risk: {hotspot['risk_score']:.2f})"
-                    ).add_to(m)
-                    
-                    # Add center marker
-                    folium.Marker(
-                        location=[hotspot['center_lat'], hotspot['center_lon']],
-                        icon=folium.Icon(color='black', icon='exclamation-triangle'),
-                        popup=f"Hotspot Center #{hotspot['cluster_id']+1}"
-                    ).add_to(m)
-                
-                # Add individual crashes
-                for _, crash in valid_coords.head(200).iterrows():
-                    severity_colors = {'Severe': 'red', 'Moderate': 'orange', 'Minor': 'yellow', 'No_Injury': 'green'}
-                    crash_color = severity_colors.get(crash['severity_category'], 'gray')
+                        color, icon = 'yellow', '📍'
                     
                     folium.CircleMarker(
-                        location=[crash['latitude'], crash['longitude']],
-                        radius=2,
-                        color=crash_color,
+                        location=[hotspot['center_lat'], hotspot['center_lon']],
+                        radius=min(hotspot['crash_count'] * 2, 20),
+                        color=color,
                         fill=True,
-                        popup=f"Crash: {crash['severity_category']}<br>Date: {crash['crash_date']}"
+                        popup=f"""
+                        <b>{icon} Hotspot #{hotspot['cluster_id']+1}</b><br>
+                        🚗 Crashes: {hotspot['crash_count']}<br>
+                        ⚠️ Risk Score: {hotspot['risk_score']:.2f}<br>
+                        🔴 Severe: {hotspot['severe_count']}
+                        """
                     ).add_to(m)
                 
-                # Add legend
-                legend_html = '''
-                <div style="position: fixed; 
-                            bottom: 50px; left: 50px; width: 200px; height: 160px; 
-                            background-color: white; border:2px solid grey; z-index:9999; 
-                            font-size:12px; padding: 10px">
-                <p><b>Hotspot Legend</b></p>
-                <p><i class="fa fa-circle" style="color:red"></i> Extreme Risk (>70%)</p>
-                <p><i class="fa fa-circle" style="color:orange"></i> High Risk (40-70%)</p>
-                <p><i class="fa fa-circle" style="color:yellow"></i> Moderate Risk (<40%)</p>
-                <p><i class="fa fa-exclamation-triangle" style="color:black"></i> Hotspot Center</p>
-                <p><i class="fa fa-circle" style="color:red"></i> Individual Crashes</p>
-                </div>
-                '''
-                m.get_root().html.add_child(folium.Element(legend_html))
-                
                 st_folium(m, width=700, height=500)
-                
-                st.info(f"📍 Showing {len(hotspots_df)} hotspots and {min(200, len(valid_coords))} individual crashes")
             
-            # Hotspot analysis summary
-            st.subheader("📋 Hotspot Analysis Summary")
+            # Top dangerous hotspots in a clean table
+            st.subheader("Most Dangerous Hotspots")
+            
+            top_hotspots = hotspots_df.head(10).copy()
+            
+            # Create display dataframe
+            display_df = pd.DataFrame({
+                'Rank': range(1, len(top_hotspots) + 1),
+                'Risk Level': top_hotspots['risk_score'].apply(lambda x: 
+                    '🔴 EXTREME' if x > 0.7 else 
+                    '🟠 HIGH' if x > 0.4 else 
+                    '🟡 MODERATE'),
+                'Total Crashes': top_hotspots['crash_count'],
+                'Severe Crashes': top_hotspots['severe_count'],
+                'Risk Score': top_hotspots['risk_score'].round(2),
+                'Location': top_hotspots.apply(lambda row: 
+                    f"{row['center_lat']:.4f}, {row['center_lon']:.4f}", axis=1)
+            })
+            
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            
+            # Quick insights
+            st.subheader("Key Insights")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                st.write("**🎯 Key Findings:**")
-                st.write(f"• {len(hotspots_df)} crash hotspots identified")
-                st.write(f"• {high_risk_hotspots} high-risk zones require immediate attention")
-                st.write(f"• {total_crashes_in_hotspots} crashes occurred in hotspot areas")
-                st.write(f"• Average risk score: {avg_risk:.2f}")
+                st.markdown("**Analysis Summary:**")
+                extreme_zones = len(hotspots_df[hotspots_df['risk_score'] > 0.7])
+                if extreme_zones > 0:
+                    st.error(f"{extreme_zones} EXTREME danger zones identified")
+                
+                high_zones = len(hotspots_df[hotspots_df['risk_score'] > 0.4])
+                if high_zones > 0:
+                    st.warning(f"{high_zones} HIGH risk areas need attention")
+                
+                coverage = (total_crashes / len(filtered_df) * 100) if len(filtered_df) > 0 else 0
+                st.info(f"{coverage:.1f}% of crashes occur in hotspots")
             
             with col2:
-                st.write("**🛡️ Recommendations:**")
-                if high_risk_hotspots > 0:
-                    st.write("• Deploy additional traffic enforcement in red zones")
-                    st.write("• Install speed cameras and warning signs")
-                    st.write("• Improve road infrastructure in hotspot areas")
-                    st.write("• Conduct safety awareness campaigns")
+                st.markdown("**Recommendations:**")
+                if extreme_zones > 0:
+                    st.write("• 🚔 Deploy traffic police to red zones")
+                    st.write("• 📹 Install speed cameras immediately")
+                    st.write("• 🚧 Review road infrastructure")
                 else:
-                    st.write("• Continue monitoring identified hotspots")
-                    st.write("• Maintain current safety measures")
-                    st.write("• Regular review of hotspot parameters")
-            
+                    st.write("• Continue current monitoring")
+                    st.write("• Regular hotspot analysis")
+                    st.write("• Update detection parameters")
+        
         else:
-            st.warning("⚠️ No hotspots detected with current parameters.")
-            st.info("💡 Try adjusting the radius or minimum samples, or check if there's sufficient data.")
+            st.warning("No hotspots detected")
+            st.info("Try adjusting the radius or minimum crashes settings")
     
     else:
-        st.error("❌ No data available for hotspot analysis")
+        st.error("No data available for analysis")
 
-elif page == "📋 History":
-    st.header("📋 Prediction History")
+elif page == "History":
+    st.header("Prediction History")
     
-    if len(st.session_state.user_history) > 0:
-        st.subheader(f"📊 Your Last {len(st.session_state.user_history)} Predictions")
-        
-        # Convert history to DataFrame for better display
+    if st.session_state.user_history:
         history_df = pd.DataFrame(st.session_state.user_history)
-        history_df['timestamp'] = pd.to_datetime(history_df['timestamp'])
-        history_df = history_df.sort_values('timestamp', ascending=False)
         
-        # Summary statistics
-        col1, col2, col3, col4 = st.columns(4)
+        # Display history table
+        st.subheader("Recent Predictions")
         
-        with col1:
-            st.metric("Total Predictions", len(history_df))
-        
-        with col2:
-            avg_confidence = history_df['confidence'].mean()
-            st.metric("Avg Confidence", f"{avg_confidence:.1%}")
-        
-        with col3:
-            severe_predictions = len(history_df[history_df['severity'] == 'Severe'])
-            st.metric("Severe Risk Predictions", severe_predictions)
-        
-        with col4:
-            avg_risk_score = history_df['risk_score'].mean()
-            st.metric("Avg Risk Score", f"{avg_risk_score:.1f}/10")
-        
-        # History table
-        st.subheader("📝 Detailed History")
-        
-        # Format the display
-        display_df = history_df.copy()
-        display_df['Time'] = display_df['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
-        display_df['Confidence'] = display_df['confidence'].apply(lambda x: f"{x:.1%}")
-        display_df['Risk Score'] = display_df['risk_score'].apply(lambda x: f"{x:.1f}/10")
-        
-        # Color code severity
-        def color_severity(val):
+        # Style the dataframe
+        def style_severity(val):
             if val == 'Severe':
                 return 'background-color: #ffebee'
             elif val == 'Moderate':
                 return 'background-color: #fff3e0'
-            elif val == 'Minor':
-                return 'background-color: #f9fbe7'
             else:
                 return 'background-color: #e8f5e8'
         
-        styled_df = display_df[['Time', 'location', 'severity', 'Confidence', 'Risk Score']].style.applymap(
-            color_severity, subset=['severity']
-        )
+        styled_df = history_df.style.applymap(style_severity, subset=['severity'])
         
         st.dataframe(styled_df, use_container_width=True)
         
         # Trends analysis
         if len(history_df) > 1:
-            st.subheader("📈 Your Risk Trends")
+            st.subheader("Your Risk Trends")
             
             col1, col2 = st.columns(2)
             
@@ -1094,167 +1537,104 @@ elif page == "📋 History":
                 st.plotly_chart(fig, use_container_width=True)
         
         # Export history
-        st.subheader("📥 Export History")
+        st.subheader("Export History")
         
-        if st.button("📄 Download Prediction History"):
+        if st.button("Download Prediction History"):
             csv = history_df.to_csv(index=False)
             st.download_button(
-                label="💾 Download as CSV",
+                label="Download as CSV",
                 data=csv,
                 file_name=f"prediction_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                 mime="text/csv"
             )
         
         # Clear history
-        if st.button("🗑️ Clear History", type="secondary"):
-            if st.button("⚠️ Confirm Clear History"):
+        if st.button("Clear History", type="secondary"):
+            if st.button("Confirm Clear History"):
                 st.session_state.user_history = []
-                st.success("✅ History cleared!")
+                st.success("History cleared!")
                 st.rerun()
     
     else:
-        st.info("📭 No predictions made yet. Go to the Prediction page to start!")
-        
-        if st.button("🎯 Go to Prediction Page"):
-            st.switch_page("🎯 Prediction")
+        st.info("No predictions made yet. Go to the Prediction page to start!")
 
-elif page == "ℹ️ About":
-    st.header("ℹ️ About Nairobi Crash Risk Predictor")
-    
+elif page == "About":
+    st.header("About Nairobi Crash Risk Predictor")
+
     st.markdown("""
-    ### 🎯 Project Overview
-    
-    The **Nairobi Crash Risk Predictor** is an advanced AI-powered system designed to predict and analyze road crash risks in Nairobi, Kenya. Using machine learning algorithms and historical crash data, it provides real-time risk assessments and safety recommendations.
-    
-    ### 🔬 Technical Details
-    
-    **Machine Learning Models:**
-    - Random Forest Classifier
-    - XGBoost Classifier
-    - Feature engineering with temporal and spatial variables
-    - Dynamic risk scoring with multiple factors
-    
-    **Key Features:**
-    - Real-time crash risk prediction
-    - Advanced hotspot detection using DBSCAN clustering
-    - Interactive visualizations and maps
-    - Safety recommendations based on context
-    - Historical analysis and trends
-    - Downloadable risk assessment reports
-    
-    ### 📊 Data Sources
-    
-    - Historical crash data from Nairobi traffic authorities
-    - Geographic coordinates and location information
-    - Temporal patterns (hour, day, month)
-    - Crash severity classifications
-    - Vehicle type involvement data
-    
-    ### 🛠️ Technology Stack
-    
-    - **Frontend:** Streamlit
-    - **Machine Learning:** scikit-learn, XGBoost
-    - **Data Processing:** pandas, numpy
-    - **Visualization:** Plotly, Folium
-    - **Geospatial:** GeoPy, Folium
-    - **Clustering:** DBSCAN algorithm
-    
-    ### 📈 Model Performance
-    
-    Our models have been trained and validated on historical crash data with the following considerations:
-    - Cross-validation for model reliability
-    - Feature importance analysis
-    - Temporal validation to ensure robustness
-    - Regular model updates with new data
-    
-    ### 🎯 Use Cases
-    
-    **For Drivers:**
-    - Get risk assessments before traveling
-    - Receive safety recommendations
-    - Plan safer routes and timing
-    
-    **For Traffic Authorities:**
-    - Identify high-risk areas for intervention
-    - Deploy resources more effectively
-    - Monitor crash patterns and trends
-    
-    **For Urban Planners:**
-    - Understand crash hotspots for infrastructure planning
-    - Analyze temporal patterns for traffic management
-    - Support evidence-based decision making
-    
-    ### ⚠️ Important Disclaimers
-    
-    - This system provides risk assessments based on historical data and should not be the sole factor in safety decisions
-    - Always follow traffic rules and drive according to current road conditions
-    - Risk predictions are probabilistic and cannot guarantee safety outcomes
-    - The system is designed to supplement, not replace, human judgment and official traffic guidance
-    
-    ### 🔮 Future Enhancements
-    
-    - Real-time weather integration
-    - Live traffic data incorporation
-    - Mobile app development
-    - Integration with navigation systems
-    - Expanded coverage to other Kenyan cities
-    - Community reporting features
-    
-    ### 👥 Development Team
-    
-    This project was developed as part of advanced data science and machine learning research focused on improving road safety in urban environments.
-    
-    ### 📞 Contact & Support
-    
-    For technical support, feature requests, or data inquiries, please contact the development team.
-    
+    ### Overview
+
+    The **Nairobi Crash Risk Predictor** is an AI-powered system designed to assess road crash risks across Nairobi using historical crash data. It supports safer travel by providing real-time risk scores and location-based insights.
+
+    ### Model and Features
+
+    - **Best Model:** XGBoost Classifier
+    - **Risk Scoring:** Based on time, location, severity, and other variables
+    - **Hotspot Analysis:** Using DBSCAN clustering
+    - **Route Evaluation:** Highlights risk levels along selected routes
+    - **Safety Tips:** Contextual recommendations to reduce crash exposure
+
+    ### How It Works
+
+    Crash reports are analyzed using geospatial and temporal features. The model identifies risk-prone areas and computes personalized risk assessments for drivers, helping make informed travel decisions.
+
+    ### Technology Stack
+
+    - **Modeling:** XGBoost, DBSCAN
+    - **Data Tools:** pandas, numpy
+    - **Geospatial:** Folium, GeoPy
+    - **Interface:** Streamlit
+
+    ### Who Can Benefit
+
+    - **Drivers:** Plan routes with fewer risks
+    - **Traffic Agencies:** Allocate patrols to risk zones
+    - **City Planners:** Identify where safety infrastructure is needed
+
     ---
-    
-    **Version:** 2.0  
-    **Last Updated:** {datetime.now().strftime('%B %Y')}  
-    **License:** Educational and Research Use
+    **Note:** This system is built for educational purposes. Predictions are based on historical trends and should complement—not replace—caution and traffic rules.
     """)
-    
+
     # System status
-    st.subheader("🔧 System Status")
-    
+    st.subheader("System Status")
+
     col1, col2, col3 = st.columns(3)
-    
+
     with col1:
-        st.success("✅ Data Loaded" if df is not None else "❌ Data Not Loaded")
-    
+        st.success("Data Loaded" if df is not None else "Data Not Loaded")
+
     with col2:
-        st.success("✅ Models Loaded" if model is not None else "❌ Models Not Loaded")
-    
+        st.success("Models Loaded" if model is not None else "Models Not Loaded")
+
     with col3:
-        st.info(f"📊 {len(st.session_state.user_history)} Predictions Made")
-    
-    # Performance metrics (if available)
+        st.info(f"{len(st.session_state.user_history)} Predictions Made")
+
+    # Dataset metrics
     if df is not None:
-        st.subheader("📊 Dataset Statistics")
-        
+        st.subheader("Dataset Statistics")
+
         col1, col2, col3, col4 = st.columns(4)
-        
+
         with col1:
             st.metric("Total Records", f"{len(df):,}")
-        
+
         with col2:
             date_range = (pd.to_datetime(df['crash_date'].max()) - pd.to_datetime(df['crash_date'].min())).days
             st.metric("Date Range", f"{date_range} days")
-        
+
         with col3:
             valid_coords = len(df.dropna(subset=['latitude', 'longitude']))
             st.metric("Geo-located Crashes", f"{valid_coords:,}")
-        
+
         with col4:
             severe_rate = len(df[df['severity_category'] == 'Severe']) / len(df) * 100
             st.metric("Severe Crash Rate", f"{severe_rate:.1f}%")
 
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='text-align: center; color: #666; padding: 20px;'>
-    <p>🚗 Nairobi Crash Risk Predictor v2.0 | Built with ❤️ for Road Safety</p>
-    <p>⚠️ Always drive safely and follow traffic rules</p>
-</div>
-""", unsafe_allow_html=True)
+    # Footer
+    st.markdown("---")
+    st.markdown(f"""
+    <div style='text-align: center; color: #666; padding: 20px;'>
+        <p>Nairobi Crash Risk Predictor v2.0 | Built for Road Safety</p>
+        <p>Last Updated: {datetime.now().strftime('%B %Y')}</p>
+    </div>
+    """, unsafe_allow_html=True)
