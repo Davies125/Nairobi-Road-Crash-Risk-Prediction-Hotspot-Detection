@@ -1,5 +1,6 @@
 # Nairobi Road Crash Risk Prediction & Hotspot Detection
 ![App Screenshot](screenshots/app-dashboard.png)
+**Live Demo**: [Click here to access the deployed app](https://nairobi-road-crash-risk-prediction-hotspot-detection.streamlit.app/)
 ## Table of Contents
 - [Introduction](#introduction)
 - [Features](#features)
@@ -138,7 +139,7 @@ The system employs multiple machine learning approaches:
 
 The application is deployed using Streamlit and can be accessed through a web browser. The deployment includes:
 
-- **Streamlit Web App**: Interactive dashboard with multiple pages
+- **Streamlit Web App**: Interactive dashboard with multiple pages [Access the live application here](https://nairobi-road-crash-risk-prediction-hotspot-detection.streamlit.app/)
 - **Model Persistence**: Trained models saved using joblib
 - **Real-time Predictions**: Instant risk assessment capabilities
 - **Interactive Maps**: Folium-based visualizations
